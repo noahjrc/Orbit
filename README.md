@@ -20,7 +20,7 @@ If something doesn't work on your setup, please [open an issue](../../issues).
 ## Features
 
 - **Main menu:** a ring of six items: XBOX, XBOX 360, ARCADE, APPS, FILES, SETTINGS. Items you don't use can be hidden (see [Hiding menu items](#hiding-menu-items)).
-- **Shelves:** 3D game cases (black for original Xbox, green for 360, orange for Arcade) with your box art. Games without art get a cover drawn for them.
+- **Shelves:** 3D game cases (black for original Xbox, green for 360) with your box art, square orange tiles showing each Arcade game's own icon, and tiles for apps. Anything without art gets a cover drawn for it.
   - **A** launch, **X** back cover, **Y** details (title, version, size, delete).
 - **Launching:** original Xbox games, installed 360 games (Games on Demand packages), Arcade games, apps, and any `.xex` / `.xbe` file from FILES.
 - **FILES:** browse `Hdd1`, `Usb0`–`Usb2` and `Dvd`, then copy, paste, delete, rename (**LB**) and make new folders (**LT**). Names are typed on the console's own keyboard; if it asks for a profile, the sign-in screen comes up first. System folders are protected.
@@ -208,15 +208,17 @@ Your choice is saved in `theme.txt`, next to `Orbit.xex`.
 
 ## Box art
 
-Box art is optional; games without it get a cover drawn for them.
+Box art is for original Xbox games, Xbox 360 games and apps (Arcade games use their own icons, see below). It's optional; anything without it gets a cover drawn for it.
 
-1. Find the `Covers` folder inside Orbit's own folder, for example `Usb0:\Apps\Orbit\Covers\` or `Hdd1:\Apps\Orbit\Covers\` (with Peer Pressure, `Hdd1:\PeerPressure\Dashboard\Covers\`). Orbit creates it the first time it starts, on whichever drive it runs from. (Covers in `Usb0:\Orbit\Covers\`, where versions before 0.9.1 looked, still work.)
+1. Find the `Covers` folder inside Orbit's own folder, for example `Usb0:\Apps\Orbit\Covers\` or `Hdd1:\Apps\Orbit\Covers\` (with Peer Pressure, `Hdd1:\PeerPressure\Dashboard\Covers\`). Orbit creates it the first time it starts, on whichever drive it runs from. (Versions before 0.9.1 looked in `Usb0:\Orbit\Covers\`; Orbit no longer does, so move any covers from there into this folder.)
 2. Put covers in it named by title ID, for example `4D5307E6.jpg` for Halo 3. A game's title ID is shown in its content folder name (`Content\0000000000000000\<TitleID>`) or on xboxunity.net.
 3. Run **SCAN NOW** in SETTINGS, or restart Orbit, to load them.
 
 Orbit expects full wrap-around scans of 900×600 pixels, laid out back | spine | front, like the ones on [xboxunity.net](https://xboxunity.net). JPG and PNG both work.
 
 The first time Orbit loads a cover it saves a ready-to-draw copy in `Covers\Cache\`, so later starts are much quicker. Replacing a cover image is picked up automatically. The `Cache` folder is safe to delete; Orbit rebuilds it on the next start.
+
+Arcade games don't use the `Covers` folder: their square tiles show the game's own icon, which a scan copies out of each package into `Covers\Icons\` (named by title ID). That folder is safe to delete too; the next **SCAN NOW** saves the icons again.
 
 ## Title updates and DLC
 

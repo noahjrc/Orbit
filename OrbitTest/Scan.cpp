@@ -234,6 +234,46 @@ static void AddXex( const char* szDir, const char* szXexName, BOOL bApp )
     Commit();
 }
 
+// A package's icon (the header's thumbnail, else its title thumbnail; PNGs, usually
+// 64 x 64) saved once as game:\Covers\Icons\<title ID>.png for the ARCADE shelf. It's
+// written under another name and renamed when whole, so a half-written file is never used.
+static void SaveIcon( const char* szFile, const char* szTitleId )
+{
+    char szIcon[MAX_PATH], szTemp[MAX_PATH];
+    sprintf_s( szIcon, "game:\\Covers\\Icons\\%s.png", szTitleId );
+    WIN32_FILE_ATTRIBUTE_DATA Attr;
+    if( GetFileAttributesExA( szIcon, GetFileExInfoStandard, &Attr ) )
+        return;
+
+    BYTE Sizes[8];
+    if( !ReadHead( szFile, Sizes, sizeof(Sizes), 0x1712 ) )
+        return;
+    DWORD dwSize = BE32( Sizes ), dwOffset = 0x171A;
+    if( dwSize == 0 )
+        dwSize = BE32( Sizes + 4 ), dwOffset = 0x571A;
+    if( dwSize == 0 || dwSize > 0x4000 )
+        return;
+
+    static const BYTE c_PngSig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    BYTE* pPng = new BYTE[dwSize];
+    if( ReadHead( szFile, pPng, dwSize, dwOffset ) && dwSize > sizeof(c_PngSig) && memcmp( pPng, c_PngSig, sizeof(c_PngSig) ) == 0 )
+    {
+        CreateDirectoryA( "game:\\Covers", NULL );
+        CreateDirectoryA( "game:\\Covers\\Icons", NULL );
+        sprintf_s( szTemp, "game:\\Covers\\Icons\\%s.tmp", szTitleId );
+        HANDLE h = CreateFileA( szTemp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+        if( h != INVALID_HANDLE_VALUE )
+        {
+            DWORD dwWritten = 0;
+            BOOL bOK = WriteFile( h, pPng, dwSize, &dwWritten, NULL ) && dwWritten == dwSize;
+            CloseHandle( h );
+            if( !bOK || !MoveFileA( szTemp, szIcon ) )
+                DeleteFileA( szTemp );
+        }
+    }
+    delete[] pPng;
+}
+
 // A content package (STFS: LIVE / PIRS / CON): display name, type and version from its header
 static void AddPackage( const char* szFile, ULONGLONG qwFileSize )
 {
@@ -260,6 +300,8 @@ static void AddPackage( const char* szFile, ULONGLONG qwFileSize )
         strcpy_s( p->szTitle, BaseName( szFile ) );
     FormatVersion360( BE32( Head + 0x358 ), p->szVersion, sizeof(p->szVersion) );
     sprintf_s( p->szTitleId, "%08X", BE32( Head + 0x360 ) );
+    if( nShelf == SHELF_ARCADE )
+        SaveIcon( szFile, p->szTitleId );
 
     // The package and its "<name>.data" folder; delete takes the type folder holding them
     char szData[MAX_PATH];

@@ -18,11 +18,12 @@
 //   cover level   : 1 front / 0.55 others (the side cases are dimmer)
 //
 // The items come from the scan (Scan.h). Box art comes from the Covers folder next to
-// Orbit.xex (game:\Covers\<title ID>.jpg or .png), or from Usb0:\Orbit\Covers\, where
-// versions before 0.9.1 looked. A full box scan (back | spine | front side by side, XboxUnity's
+// Orbit.xex (game:\Covers\<title ID>.jpg or .png). A full box scan (back | spine | front side by side, XboxUnity's
 // 900 x 600 layout) wraps the whole case and gives it a back cover; a portrait image
 // is just the front. Decoding an image is slow, so the first load saves the result in
-// a Cache folder beside it and later boots copy that in instead. Without art, a cover
+// a Cache folder beside it and later boots copy that in instead. ARCADE tiles are
+// square and show the icon from the game's package (Covers\Icons\<title ID>.png, saved
+// by the scan) inside the orange lip, not the Covers folder's art. Without art, a cover
 // is made here on the console: a baked template (one of six hues, picked from the
 // title) with the title written on it, rendered to a 256 x 352 texture a couple per
 // frame as they come into view.
@@ -58,9 +59,10 @@ extern "C"
 static const char* c_szShelfNames[NUM_SHELVES] = { "XBOX", "XBOX 360", "ARCADE", "APPS" };
 static const char* c_szShelfKinds[NUM_SHELVES] = { "ORIGINAL XBOX", "XBOX 360", "ARCADE", "APP" };
 static const BOOL  c_bShelfBacks[NUM_SHELVES]  = { TRUE, TRUE, FALSE, FALSE };   // drawn backs: only boxed games
-// Covers folders, searched in order: Orbit's own folder (on whatever drive it runs
-// from), then the USB location older versions used
-static const char* c_szCoverDirs[] = { "game:\\Covers\\", "Usb0:\\Orbit\\Covers\\" };
+// Covers folders, searched in order: only Orbit's own folder (on whatever drive it runs
+// from). Not Usb0:\Orbit\Covers, where versions before 0.9.1 looked: touching a USB hard
+// drive at boot wakes it, which held the first frame back about 14 seconds.
+static const char* c_szCoverDirs[] = { "game:\\Covers\\" };
 
 // Where each face sits in a box scan (fractions of its width): back | spine | front
 static const float WRAP_SPINE_L = 425.0f / 900.0f, WRAP_SPINE_R = 475.0f / 900.0f;
@@ -81,6 +83,8 @@ static const CaseLook c_Looks[NUM_SHELVES] =
 // thin tiles facing the camera, fronts only, and never their backs
 static const BOOL  c_bShelfBoxed[NUM_SHELVES] = { TRUE, TRUE, FALSE, FALSE };
 static const float TILE_DEPTH = 0.25f;   // of a case's depth
+// ARCADE tiles are square, the shape of the package icons they show
+static const BOOL  c_bShelfSquare[NUM_SHELVES] = { FALSE, FALSE, TRUE, FALSE };
 static const float LIP_U = 0.025f, LIP_V = 0.018f;   // about 3mm of a 135 x 190mm case
 static const float SHEEN = 0.05f;
 
@@ -117,7 +121,7 @@ static D3DTexture* s_pCover[NUM_SHELVES][MAX_SHELF];   // drawn covers (no art)
 static D3DTexture* s_pBack[NUM_SHELVES][MAX_SHELF];
 static D3DTexture* s_pArt[NUM_SHELVES][MAX_SHELF];     // box art from the covers folder
 static BYTE        s_Art[NUM_SHELVES][MAX_SHELF];      // ART_* below
-enum { ART_UNTRIED, ART_NONE, ART_FRONT, ART_WRAP };
+enum { ART_UNTRIED, ART_NONE, ART_FRONT, ART_WRAP, ART_ICON };   // ART_ICON: an ARCADE package's icon
 static BOOL        s_bHudDirty = FALSE;                // art arrived for the front case
 static D3DSurface* s_pCoverRT = NULL;
 static float       s_vPlastic[NUM_TEMPLATES][4];   // linear
@@ -309,19 +313,22 @@ static const HudColor C_NONE  = { 0.0f, 0.0f, 0.0f, 0.0f };
 
 static D3DTexture* MakeCover( D3DDevice* pDevice, const ScanItem& it, BOOL bBack )
 {
+    // Square shelves get a square cover: the template's top (its ORBIT bar) is cut off
+    const UINT  nH   = c_bShelfSquare[it.nShelf] ? COVER_W : COVER_H;
+    const float fTop = (float)nH - COVER_H;
     D3DTexture* pTex = NULL;
-    if( !s_pCoverRT || FAILED( pDevice->CreateTexture( COVER_W, COVER_H, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &pTex, NULL ) ) )
+    if( !s_pCoverRT || FAILED( pDevice->CreateTexture( COVER_W, nH, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &pTex, NULL ) ) )
         return NULL;
 
     pDevice->SetRenderTarget( 0, s_pCoverRT );
     pDevice->SetDepthStencilSurface( NULL );
-    D3DVIEWPORT9 vp = { 0, 0, COVER_W, COVER_H, 0.0f, 1.0f };
+    D3DVIEWPORT9 vp = { 0, 0, COVER_W, nH, 0.0f, 1.0f };
     pDevice->SetViewport( &vp );
     pDevice->Clear( 0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB( 0, 0, 0 ), 1.0f, 0 );
 
     int t = TemplateFor( it.szTitle );
-    Hud_BeginDrawTarget( pDevice, COVER_W, COVER_H );
-    Hud_DrawSprite( pDevice, bBack ? s_pBackTpl[t] : s_pCoverTpl[t], 0.0f, 0.0f, (float)COVER_W, (float)COVER_H, 1.0f );
+    Hud_BeginDrawTarget( pDevice, COVER_W, nH );
+    Hud_DrawSprite( pDevice, bBack ? s_pBackTpl[t] : s_pCoverTpl[t], 0.0f, fTop, (float)COVER_W, (float)COVER_H, 1.0f );
 
     char szTitle[64], szLines[3][64];
     UpperCopy( szTitle, sizeof(szTitle), it.szTitle );
@@ -336,13 +343,13 @@ static D3DTexture* MakeCover( D3DDevice* pDevice, const ScanItem& it, BOOL bBack
         for( int k = 0; k < nLines; k++ )
         {
             float w = Hud_TextWidth( HUD_FONT_TITLE, szLines[k], fPx, fPx * 0.02f );
-            float y = 65.0f + k * fPx * 1.12f + fPx * 0.35f;
+            float y = ( fTop < 0.0f ? 28.0f : 65.0f ) + k * fPx * 1.12f + fPx * 0.35f;
             Hud_DrawText( pDevice, HUD_FONT_TITLE, szLines[k], COVER_W * 0.5f - w * 0.5f, y, fPx, fPx * 0.02f, C_TITLE, C_GLOW );
         }
         // Bottom strip: what it is
         const char* szKind = c_szShelfKinds[it.nShelf];
         float w = Hud_TextWidth( HUD_FONT_MONO, szKind, 10.0f, 2.0f );
-        Hud_DrawText( pDevice, HUD_FONT_MONO, szKind, COVER_W * 0.5f - w * 0.5f, COVER_H - 9.0f, 10.0f, 2.0f, C_SUB, C_NONE );
+        Hud_DrawText( pDevice, HUD_FONT_MONO, szKind, COVER_W * 0.5f - w * 0.5f, nH - 9.0f, 10.0f, 2.0f, C_SUB, C_NONE );
     }
     else
     {
@@ -365,7 +372,8 @@ static D3DTexture* MakeCover( D3DDevice* pDevice, const ScanItem& it, BOOL bBack
     }
     Hud_EndDraw( pDevice );
 
-    pDevice->Resolve( D3DRESOLVE_RENDERTARGET0, NULL, pTex, NULL, 0, 0, NULL, 0.0f, 0, NULL );
+    const D3DRECT Rect = { 0, 0, COVER_W, nH };
+    pDevice->Resolve( D3DRESOLVE_RENDERTARGET0, &Rect, pTex, NULL, 0, 0, NULL, 0.0f, 0, NULL );
     return pTex;
 }
 
@@ -523,12 +531,27 @@ static void SaveCachedArt( const char* szDir, const char* szCache, const ArtStam
 
 // Box art for an item from the covers folder, compressed to DXT1 with mips (from the
 // cache when it's there). A wide image (a box scan) wraps the case; a tall one is the front.
+// ARCADE items only show their package's icon (Covers\Icons, saved by the scan), kept
+// uncompressed: DXT1 smears an image that small.
 static void LoadArt( D3DDevice* pDevice, int nShelf, int i )
 {
     s_Art[nShelf][i] = ART_NONE;
     const ScanItem& it = Scan_GetItem( nShelf, i );
     if( !it.szTitleId[0] )
         return;
+    if( nShelf == SHELF_ARCADE )
+    {
+        char szIcon[MAX_PATH];
+        sprintf_s( szIcon, "game:\\Covers\\Icons\\%s.png", it.szTitleId );
+        D3DTexture* pTex = NULL;
+        if( SUCCEEDED( D3DXCreateTextureFromFileExA( pDevice, szIcon, D3DX_DEFAULT_NONPOW2, D3DX_DEFAULT_NONPOW2, D3DX_DEFAULT,
+                                                     0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, D3DX_DEFAULT, D3DX_DEFAULT, 0, NULL, NULL, &pTex ) ) )
+        {
+            s_pArt[nShelf][i] = pTex;
+            s_Art[nShelf][i] = ART_ICON;
+        }
+        return;
+    }
     static const char* c_szExt[] = { "jpg", "png" };
     for( int d = 0; d < ARRAYSIZE( c_szCoverDirs ); d++ )
         for( int e = 0; e < ARRAYSIZE( c_szExt ); e++ )
@@ -969,7 +992,8 @@ void Library_Render( D3DDevice* pDevice, const XMMATRIX& matView, const XMMATRIX
             continue;
         const CaseState& cs = s_Cases[i];
         const float fThick = c_bShelfBoxed[s_nShelf] ? 1.0f : TILE_DEPTH;   // tiles are thin
-        matWorld[i] = XMMatrixScaling( cs.fScale, cs.fScale, cs.fScale * fThick ) * XMMatrixRotationY( cs.fRotY )
+        const float fTall  = c_bShelfSquare[s_nShelf] ? CASE_W / CASE_H : 1.0f;
+        matWorld[i] = XMMatrixScaling( cs.fScale, cs.fScale * fTall, cs.fScale * fThick ) * XMMatrixRotationY( cs.fRotY )
                     * XMMatrixTranslation( cs.x, cs.y, cs.z ) * matLib;
         fDepth[i] = -XMVectorGetZ( XMVector3Transform( XMVectorZero(), matWorld[i] * matView ) );
         int j = nItems++;
@@ -1045,8 +1069,8 @@ void Library_Render( D3DDevice* pDevice, const XMMATRIX& matView, const XMMATRIX
             {
             case FACE_PZ:
                 if( art == ART_WRAP )       { pTex = pArt; vUV[0] = 1.0f - WRAP_SPINE_R; vUV[2] = WRAP_SPINE_R; }
-                else if( art == ART_FRONT ) pTex = pArt;
-                else                        pTex = s_pCover[s_nShelf][i];
+                else if( art == ART_FRONT || art == ART_ICON ) pTex = pArt;
+                else                                           pTex = s_pCover[s_nShelf][i];
                 vColor[0] = vColor[1] = vColor[2] = cs.fLevel;
                 break;
             case FACE_NZ:
@@ -1064,12 +1088,14 @@ void Library_Render( D3DDevice* pDevice, const XMMATRIX& matView, const XMMATRIX
             // Covers sit in the case's lip under the sleeve's sheen
             if( pTex && ( f == FACE_PZ || f == FACE_NZ ) && s_nShelf != SHELF_APPS )
             {
-                vLipParams[0] = LIP_U; vLipParams[1] = LIP_V; vLipParams[2] = SHEEN;
+                // A square face gets the same lip all round (LIP_U: a fraction of its width)
+                vLipParams[0] = LIP_U; vLipParams[1] = c_bShelfSquare[s_nShelf] ? LIP_U : LIP_V; vLipParams[2] = SHEEN;
             }
             // No art (yet, or a shelf without backs): the plastic colour
             if( !pTex && ( f == FACE_PZ || f == FACE_NZ ) )
                 memcpy( vColor, vPlastic, sizeof(vColor) );
-            float vMode[4] = { pTex ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+            // An icon's see-through parts show the lip's plastic
+            float vMode[4] = { pTex ? 1.0f : 0.0f, ( pTex && art == ART_ICON ) ? 1.0f : 0.0f, 0.0f, 0.0f };
             pDevice->SetPixelShaderConstantF( 0, vColor, 1 );
             pDevice->SetPixelShaderConstantF( 1, vMode, 1 );
             pDevice->SetPixelShaderConstantF( 3, vUV, 1 );
