@@ -25,8 +25,10 @@
 // square and show the icon from the game's package (Covers\Icons\<title ID>.png, saved
 // by the scan) inside the orange lip, not the Covers folder's art. Without art, a cover
 // is made here on the console: a baked template (one of six hues, picked from the
-// title) with the title written on it, rendered to a 256 x 352 texture a couple per
-// frame as they come into view.
+// title) with the title written on it, rendered to a 256 x 352 texture. Box art (DXT1,
+// small) stays loaded for every item; drawn covers (uncompressed, ~360 KB each) are only
+// kept near the view and made a few cases ahead of it, so a long shelf doesn't fill memory.
+// A rescan keeps the box art of items still there instead of loading it all again.
 //
 // Unlike the prototype the cases draw after bloom (as the front menu panels do), so
 // the orb's glow never washes over them.
@@ -88,7 +90,8 @@ static const BOOL  c_bShelfSquare[NUM_SHELVES] = { FALSE, FALSE, TRUE, FALSE };
 static const float LIP_U = 0.025f, LIP_V = 0.018f;   // about 3mm of a 135 x 190mm case
 static const float SHEEN = 0.05f;
 
-static const int   MAX_SHELF = 64;
+static const int   MAX_SHELF = MAX_SCAN_ITEMS;   // a shelf can hold the whole library
+static const int   SHOWN_EACH_SIDE = 4;          // cases drawn each side of the front one
 static const int   NUM_TEMPLATES = 6;
 static const int   TEMPLATE_HUES[NUM_TEMPLATES] = { 265, 300, 235, 320, 280, 250 };
 static const UINT  COVER_W = 256, COVER_H = 352;
@@ -121,8 +124,16 @@ static D3DTexture* s_pCover[NUM_SHELVES][MAX_SHELF];   // drawn covers (no art)
 static D3DTexture* s_pBack[NUM_SHELVES][MAX_SHELF];
 static D3DTexture* s_pArt[NUM_SHELVES][MAX_SHELF];     // box art from the covers folder
 static BYTE        s_Art[NUM_SHELVES][MAX_SHELF];      // ART_* below
-enum { ART_UNTRIED, ART_NONE, ART_FRONT, ART_WRAP, ART_ICON };   // ART_ICON: an ARCADE package's icon
+// ART_DECODE: its image isn't in the cache yet and waits to be decoded; ART_ICON: an
+// ARCADE package's icon
+enum { ART_UNTRIED, ART_DECODE, ART_NONE, ART_FRONT, ART_WRAP, ART_ICON };
+struct ArtStamp { DWORD dwSize, dwTimeLo, dwTimeHi; };   // an image file's size and time
+static DWORD       s_dwArtKey[NUM_SHELVES][MAX_SHELF];  // ArtKey of the art's title ID
+static ArtStamp    s_ArtStamp[NUM_SHELVES][MAX_SHELF];  // its image's stamp then
 static BOOL        s_bHudDirty = FALSE;                // art arrived for the front case
+static BYTE        s_Failed[NUM_SHELVES][MAX_SHELF];   // FAILED_* below: drawn covers that couldn't be made
+enum { FAILED_FRONT = 1, FAILED_BACK = 2 };            // (out of memory): left plastic, not retried
+static BYTE        s_ArtRetry[NUM_SHELVES][MAX_SHELF]; // decode ran out of memory: retried later
 static D3DSurface* s_pCoverRT = NULL;
 static float       s_vPlastic[NUM_TEMPLATES][4];   // linear
 static float       s_vEdge[NUM_TEMPLATES][4];
@@ -377,22 +388,10 @@ static D3DTexture* MakeCover( D3DDevice* pDevice, const ScanItem& it, BOOL bBack
     return pTex;
 }
 
-static void ReleaseCovers()
-{
-    for( int s = 0; s < NUM_SHELVES; s++ )
-        for( int i = 0; i < MAX_SHELF; i++ )
-        {
-            if( s_pCover[s][i] ) { s_pCover[s][i]->Release(); s_pCover[s][i] = NULL; }
-            if( s_pBack[s][i] )  { s_pBack[s][i]->Release();  s_pBack[s][i] = NULL; }
-            if( s_pArt[s][i] )   { s_pArt[s][i]->Release();   s_pArt[s][i] = NULL; }
-            s_Art[s][i] = ART_UNTRIED;
-        }
-}
-
 // Box art cache: Covers\Cache\<title ID>.dxt beside the image, holding the texture
 // D3DX made from it so later boots skip the decode. Big-endian, the 360's order:
 //
-//   "OCV1", image size, image time (low, high), width, height, levels, then each
+//   "OCV2", image size, image time (low, high), width, height, levels, then each
 //   level's DXT1 blocks untiled, row after row
 //
 // The image's size and time are kept so a replaced image is decoded again. Only the
@@ -401,12 +400,19 @@ static void ReleaseCovers()
 static const DWORD CACHE_HEADER = 7 * 4;
 static const DWORD MAX_CACHE    = 16 * 1024 * 1024;
 
-struct ArtStamp { DWORD dwSize, dwTimeLo, dwTimeHi; };
-
 // Mip levels a cover gets: all of them down to the packed tail (0 = the image is that small)
 static UINT ArtLevels( UINT w, UINT h )
 {
     return XGGetMipTailBaseLevel( w, h, FALSE );
+}
+
+// Nearest power of two to n, from 128 to 1024 (past 1.5x a step it rounds up)
+static UINT NearestPow2( UINT n )
+{
+    UINT p = 128;
+    while( p < 1024 && n > p + p / 2 )
+        p *= 2;
+    return p;
 }
 
 // Bytes of one level's untiled DXT1 blocks (8 bytes per 4 x 4 block)
@@ -423,13 +429,20 @@ static D3DTexture* LoadCachedArt( D3DDevice* pDevice, const char* szCache, const
                                FILE_ATTRIBUTE_NORMAL, NULL );
     if( hFile == INVALID_HANDLE_VALUE )
         return NULL;
-    DWORD dwSize = GetFileSize( hFile, NULL );
+    // The header first, so an old or stale file is turned away without reading its pixels
+    DWORD dwSize = GetFileSize( hFile, NULL ), dwRead = 0;
+    BYTE Head[CACHE_HEADER] = { 0 };
+    BOOL bHead = dwSize != INVALID_FILE_SIZE && dwSize > CACHE_HEADER && dwSize <= MAX_CACHE &&
+                 ReadFile( hFile, Head, CACHE_HEADER, &dwRead, NULL ) && dwRead == CACHE_HEADER;
+    DWORD vHead[3];
+    memcpy( vHead, Head + 4, sizeof(vHead) );
     BYTE* pData = NULL;
-    if( dwSize != INVALID_FILE_SIZE && dwSize > CACHE_HEADER && dwSize <= MAX_CACHE )
+    if( bHead && memcmp( Head, "OCV2", 4 ) == 0 &&
+        vHead[0] == Stamp.dwSize && vHead[1] == Stamp.dwTimeLo && vHead[2] == Stamp.dwTimeHi )
     {
         pData = new BYTE[dwSize];
-        DWORD dwRead = 0;
-        if( !ReadFile( hFile, pData, dwSize, &dwRead, NULL ) || dwRead != dwSize )
+        memcpy( pData, Head, CACHE_HEADER );
+        if( !ReadFile( hFile, pData + CACHE_HEADER, dwSize - CACHE_HEADER, &dwRead, NULL ) || dwRead != dwSize - CACHE_HEADER )
         {
             delete[] pData;
             pData = NULL;
@@ -443,7 +456,7 @@ static D3DTexture* LoadCachedArt( D3DDevice* pDevice, const char* szCache, const
     DWORD v[6];
     memcpy( v, pData + 4, sizeof(v) );
     const UINT w0 = v[3], h0 = v[4], nLevels = v[5];
-    BOOL bOK = memcmp( pData, "OCV1", 4 ) == 0 &&
+    BOOL bOK = memcmp( pData, "OCV2", 4 ) == 0 &&
                v[0] == Stamp.dwSize && v[1] == Stamp.dwTimeLo && v[2] == Stamp.dwTimeHi &&
                w0 > 0 && h0 > 0 && w0 <= 4096 && h0 <= 4096 && nLevels > 0 && nLevels == ArtLevels( w0, h0 );
     DWORD dwNeed = CACHE_HEADER;
@@ -498,7 +511,7 @@ static void SaveCachedArt( const char* szDir, const char* szCache, const ArtStam
 
     BYTE* pData = new BYTE[dwSize];
     const DWORD v[6] = { Stamp.dwSize, Stamp.dwTimeLo, Stamp.dwTimeHi, w0, h0, nLevels };
-    memcpy( pData, "OCV1", 4 );
+    memcpy( pData, "OCV2", 4 );
     memcpy( pData + 4, v, sizeof(v) );
     BYTE* p = pData + CACHE_HEADER;
     for( UINT lv = 0; lv < nLevels; lv++ )
@@ -515,16 +528,21 @@ static void SaveCachedArt( const char* szDir, const char* szCache, const ArtStam
         p += nBytes;
     }
 
-    // A half-written file (the console turned off) is the wrong size, so it's never used
-    char szCacheDir[MAX_PATH];
+    // Written under another name and renamed when whole (as the scan saves icons), so a
+    // half-written file (the console turned off) is never used
+    char szCacheDir[MAX_PATH], szTemp[MAX_PATH];
     sprintf_s( szCacheDir, "%sCache", szDir );
     CreateDirectory( szCacheDir, NULL );
-    HANDLE hFile = CreateFile( szCache, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+    sprintf_s( szTemp, "%s.tmp", szCache );
+    HANDLE hFile = CreateFile( szTemp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
     if( hFile != INVALID_HANDLE_VALUE )
     {
-        DWORD dwWritten;
-        WriteFile( hFile, pData, dwSize, &dwWritten, NULL );
+        DWORD dwWritten = 0;
+        BOOL bOK = WriteFile( hFile, pData, dwSize, &dwWritten, NULL ) && dwWritten == dwSize;
         CloseHandle( hFile );
+        DeleteFile( szCache );   // MoveFile won't replace an old cache file
+        if( !bOK || !MoveFile( szTemp, szCache ) )
+            DeleteFile( szTemp );
     }
     delete[] pData;
 }
@@ -533,11 +551,129 @@ static void SaveCachedArt( const char* szDir, const char* szCache, const ArtStam
 // cache when it's there). A wide image (a box scan) wraps the case; a tall one is the front.
 // ARCADE items only show their package's icon (Covers\Icons, saved by the scan), kept
 // uncompressed: DXT1 smears an image that small.
-static void LoadArt( D3DDevice* pDevice, int nShelf, int i )
+//
+// Without bDecode an image that isn't in the cache yet is left as ART_DECODE, for
+// PrepareCovers to decode later (one a frame, under the LIBRARY card). An image D3DX
+// can't read gets a marker, Cache\<title ID>.<ext>.bad holding its stamp, so it isn't
+// tried again every boot; replacing the image gives it a new stamp and another try.
+static const char* c_szArtExt[] = { "jpg", "png" };
+
+// FNV-1a of a title ID, case folded: which box art a texture shows, kept across rescans
+static DWORD ArtKey( const char* szTitleId )
+{
+    DWORD h = 2166136261u;
+    for( const char* p = szTitleId; *p; p++ )
+        h = ( h ^ (BYTE)toupper( (unsigned char)*p ) ) * 16777619u;
+    return h;
+}
+
+// The first cover image for a title ID (jpg, then png), and its stamp
+static BOOL FindArtFile( const char* szTitleId, ArtStamp* pStamp )
+{
+    for( int d = 0; d < ARRAYSIZE( c_szCoverDirs ); d++ )
+        for( int e = 0; e < ARRAYSIZE( c_szArtExt ); e++ )
+        {
+            char szPath[MAX_PATH];
+            sprintf_s( szPath, "%s%s.%s", c_szCoverDirs[d], szTitleId, c_szArtExt[e] );
+            WIN32_FILE_ATTRIBUTE_DATA Attr;
+            if( GetFileAttributesExA( szPath, GetFileExInfoStandard, &Attr ) )
+            {
+                if( pStamp )
+                {
+                    pStamp->dwSize   = Attr.nFileSizeLow;
+                    pStamp->dwTimeLo = Attr.ftLastWriteTime.dwLowDateTime;
+                    pStamp->dwTimeHi = Attr.ftLastWriteTime.dwHighDateTime;
+                }
+                return TRUE;
+            }
+        }
+    return FALSE;
+}
+
+static BOOL IsMarkedBad( const char* szBad, const ArtStamp& Stamp )
+{
+    HANDLE h = CreateFile( szBad, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
+    if( h == INVALID_HANDLE_VALUE )
+        return FALSE;
+    BYTE Data[16] = { 0 };
+    DWORD dwRead = 0;
+    BOOL bOK = ReadFile( h, Data, sizeof(Data), &dwRead, NULL ) && dwRead == sizeof(Data);
+    CloseHandle( h );
+    DWORD v[3];
+    memcpy( v, Data + 4, sizeof(v) );
+    return bOK && memcmp( Data, "OCVB", 4 ) == 0 &&
+           v[0] == Stamp.dwSize && v[1] == Stamp.dwTimeLo && v[2] == Stamp.dwTimeHi;
+}
+
+// A half-written marker is the wrong size, so it's never trusted
+static void MarkBad( const char* szDir, const char* szBad, const ArtStamp& Stamp )
+{
+    char szCacheDir[MAX_PATH];
+    sprintf_s( szCacheDir, "%sCache", szDir );
+    CreateDirectory( szCacheDir, NULL );
+    BYTE Data[16];
+    const DWORD v[3] = { Stamp.dwSize, Stamp.dwTimeLo, Stamp.dwTimeHi };
+    memcpy( Data, "OCVB", 4 );
+    memcpy( Data + 4, v, sizeof(v) );
+    HANDLE h = CreateFile( szBad, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+    if( h != INVALID_HANDLE_VALUE )
+    {
+        DWORD dwWritten;
+        WriteFile( h, Data, sizeof(Data), &dwWritten, NULL );
+        CloseHandle( h );
+    }
+}
+
+static int ShelfCount( int nShelf ) { return min( Scan_ItemCount( nShelf ), MAX_SHELF ); }
+
+// Another item with the same title ID (a game both as a folder and as a package) that
+// already has its box art shares the texture instead of loading a second copy
+static BOOL ShareArt( int nShelf, int i )
+{
+    const ScanItem& it = Scan_GetItem( nShelf, i );
+    const BOOL bIcon = nShelf == SHELF_ARCADE;
+    for( int s = 0; s < NUM_SHELVES; s++ )
+    {
+        if( ( s == SHELF_ARCADE ) != bIcon )
+            continue;
+        for( int k = 0; k < ShelfCount( s ); k++ )
+        {
+            if( ( s == nShelf && k == i ) || !s_pArt[s][k] || _stricmp( Scan_GetItem( s, k ).szTitleId, it.szTitleId ) != 0 )
+                continue;
+            s_pArt[nShelf][i] = s_pArt[s][k];
+            s_pArt[nShelf][i]->AddRef();
+            s_Art[nShelf][i]      = s_Art[s][k];
+            s_dwArtKey[nShelf][i] = s_dwArtKey[s][k];
+            s_ArtStamp[nShelf][i] = s_ArtStamp[s][k];
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static const DWORD DECODE_ROOM = 16 * 1024 * 1024;
+
+static BOOL RoomToDecode()
+{
+    MEMORYSTATUS ms;
+    GlobalMemoryStatus( &ms );
+    return ms.dwAvailPhys >= DECODE_ROOM;
+}
+
+// D3DX's out-of-memory codes aren't documented, so low free memory counts too
+static BOOL MemoryShort( HRESULT hr )
+{
+    return hr == E_OUTOFMEMORY || hr == D3DERR_OUTOFVIDEOMEMORY || !RoomToDecode();
+}
+
+static void LoadArt( D3DDevice* pDevice, int nShelf, int i, BOOL bDecode )
 {
     s_Art[nShelf][i] = ART_NONE;
+    s_ArtRetry[nShelf][i] = FALSE;
     const ScanItem& it = Scan_GetItem( nShelf, i );
     if( !it.szTitleId[0] )
+        return;
+    if( ShareArt( nShelf, i ) )
         return;
     if( nShelf == SHELF_ARCADE )
     {
@@ -547,42 +683,81 @@ static void LoadArt( D3DDevice* pDevice, int nShelf, int i )
         if( SUCCEEDED( D3DXCreateTextureFromFileExA( pDevice, szIcon, D3DX_DEFAULT_NONPOW2, D3DX_DEFAULT_NONPOW2, D3DX_DEFAULT,
                                                      0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, D3DX_DEFAULT, D3DX_DEFAULT, 0, NULL, NULL, &pTex ) ) )
         {
+            const ArtStamp NoStamp = { 0, 0, 0 };
             s_pArt[nShelf][i] = pTex;
             s_Art[nShelf][i] = ART_ICON;
+            s_dwArtKey[nShelf][i] = ArtKey( it.szTitleId );
+            s_ArtStamp[nShelf][i] = NoStamp;
         }
         return;
     }
-    static const char* c_szExt[] = { "jpg", "png" };
     for( int d = 0; d < ARRAYSIZE( c_szCoverDirs ); d++ )
-        for( int e = 0; e < ARRAYSIZE( c_szExt ); e++ )
+        for( int e = 0; e < ARRAYSIZE( c_szArtExt ); e++ )
         {
             char szPath[MAX_PATH];
-            sprintf_s( szPath, "%s%s.%s", c_szCoverDirs[d], it.szTitleId, c_szExt[e] );
+            sprintf_s( szPath, "%s%s.%s", c_szCoverDirs[d], it.szTitleId, c_szArtExt[e] );
             WIN32_FILE_ATTRIBUTE_DATA Attr;
             if( !GetFileAttributesExA( szPath, GetFileExInfoStandard, &Attr ) )
                 continue;
             const ArtStamp Stamp = { Attr.nFileSizeLow, Attr.ftLastWriteTime.dwLowDateTime,
                                      Attr.ftLastWriteTime.dwHighDateTime };
-            char szCache[MAX_PATH];
+            char szCache[MAX_PATH], szBad[MAX_PATH];
             sprintf_s( szCache, "%sCache\\%s.dxt", c_szCoverDirs[d], it.szTitleId );
+            sprintf_s( szBad, "%sCache\\%s.%s.bad", c_szCoverDirs[d], it.szTitleId, c_szArtExt[e] );
 
             D3DTexture* pTex = LoadCachedArt( pDevice, szCache, Stamp );
             if( !pTex )
             {
-                // Levels down to the packed tail, so the result can be cached
-                D3DXIMAGE_INFO Info;
-                UINT nLevels = D3DX_DEFAULT;
-                if( SUCCEEDED( D3DXGetImageInfoFromFileA( szPath, &Info ) ) && ArtLevels( Info.Width, Info.Height ) > 0 )
-                    nLevels = ArtLevels( Info.Width, Info.Height );
-                if( FAILED( D3DXCreateTextureFromFileExA( pDevice, szPath, D3DX_DEFAULT_NONPOW2, D3DX_DEFAULT_NONPOW2, nLevels,
-                                                          0, D3DFMT_DXT1, D3DPOOL_MANAGED, D3DX_DEFAULT, D3DX_DEFAULT, 0, NULL, NULL, &pTex ) ) )
+                if( IsMarkedBad( szBad, Stamp ) )
                     continue;
+                if( !bDecode )
+                {
+                    s_Art[nShelf][i] = ART_DECODE;
+                    return;
+                }
+                // Scaled to a power-of-two size so its mip levels are exactly half the
+                // level above, which is how LevelBytes and the cache lay them out (box
+                // scans are 900 x 600; the GPU pads such a texture's mips, which scrambled
+                // the cached covers). Each side goes to the nearest power of two, at most
+                // 1024; a box scan is kept 2:1 (900 x 600 -> 1024 x 512) and a front never
+                // wider than tall, so wide still means wrap below. Levels down to the
+                // packed tail, so the result can be cached.
+                D3DXIMAGE_INFO Info;
+                HRESULT hr = D3DXGetImageInfoFromFileA( szPath, &Info );
+                if( FAILED( hr ) )
+                {
+                    if( MemoryShort( hr ) )
+                    {
+                        s_ArtRetry[nShelf][i] = TRUE;
+                        return;
+                    }
+                    MarkBad( c_szCoverDirs[d], szBad, Stamp );
+                    continue;
+                }
+                const BOOL bWide = Info.Width > Info.Height * 1.2f;
+                const UINT w = NearestPow2( Info.Width );
+                const UINT h = bWide ? w / 2 : max( w, NearestPow2( Info.Height ) );
+                const UINT nLevels = ArtLevels( w, h );
+                hr = D3DXCreateTextureFromFileExA( pDevice, szPath, w, h, nLevels, 0, D3DFMT_DXT1, D3DPOOL_MANAGED,
+                                                   D3DX_FILTER_LINEAR, D3DX_FILTER_BOX, 0, NULL, NULL, &pTex );   // the default (triangle) filter is far slower
+                if( FAILED( hr ) )
+                {
+                    if( MemoryShort( hr ) )
+                    {
+                        s_ArtRetry[nShelf][i] = TRUE;
+                        return;
+                    }
+                    MarkBad( c_szCoverDirs[d], szBad, Stamp );
+                    continue;
+                }
                 SaveCachedArt( c_szCoverDirs[d], szCache, Stamp, pTex );
             }
             D3DSURFACE_DESC Desc;
             pTex->GetLevelDesc( 0, &Desc );
             s_pArt[nShelf][i] = pTex;
             s_Art[nShelf][i] = ( Desc.Width > Desc.Height * 1.2f ) ? ART_WRAP : ART_FRONT;
+            s_dwArtKey[nShelf][i] = ArtKey( it.szTitleId );
+            s_ArtStamp[nShelf][i] = Stamp;
             return;
         }
 }
@@ -597,48 +772,260 @@ static BOOL HasBack( int nShelf, int i )
     return c_bShelfBacks[nShelf];
 }
 
-static BOOL s_bReleasePending = FALSE;   // the library changed: old covers go before new ones are made
 
-// Makes what's missing for one item: its box art (if any), else its drawn cover and
-// back. Returns the work done: 2 for an image file (decoding is the slow part), else
-// 1 per drawn cover; stops early once nBudget is used.
-static int EnsureCovers( D3DDevice* pDevice, int nShelf, int i, int nBudget )
+//-------------------------------------------------------------------------------------
+// Drawn covers come and go with the view. One the GPU may still be drawing waits here
+// until a fence says it's done with it.
+//-------------------------------------------------------------------------------------
+struct Dropped { D3DTexture* pTex; DWORD dwFence; };
+static const int MAX_DROPPED = 64;
+static Dropped   s_Dropped[MAX_DROPPED];
+static int       s_nDropped = 0;
+
+static void DropTexture( D3DDevice* pDevice, D3DTexture*& pTex )
 {
-    BYTE& art = s_Art[nShelf][i];
-    if( art == ART_UNTRIED )
+    if( !pTex )
+        return;
+    if( s_nDropped == MAX_DROPPED )
     {
-        LoadArt( pDevice, nShelf, i );
-        if( nShelf == s_nShelf && i == s_nIndex )
-            s_bHudDirty = TRUE;   // X BACK COVER may now apply
-        return 2;
+        // Full: wait for the oldest (the GPU is a frame or two behind at most)
+        pDevice->BlockOnFence( s_Dropped[0].dwFence );
+        s_Dropped[0].pTex->Release();
+        memmove( s_Dropped, s_Dropped + 1, ( MAX_DROPPED - 1 ) * sizeof(Dropped) );
+        s_nDropped--;
     }
-    int nMade = 0;
-    const ScanItem& it = Scan_GetItem( nShelf, i );
-    if( art == ART_NONE && !s_pCover[nShelf][i] && nMade < nBudget )
+    s_Dropped[s_nDropped].pTex    = pTex;
+    s_Dropped[s_nDropped].dwFence = pDevice->InsertFence();   // after every draw that used it
+    s_nDropped++;
+    pTex = NULL;
+}
+
+static void ReleaseDropped( D3DDevice* pDevice )
+{
+    int k = 0;
+    for( int j = 0; j < s_nDropped; j++ )
     {
-        s_pCover[nShelf][i] = MakeCover( pDevice, it, FALSE );
+        if( pDevice->IsFencePending( s_Dropped[j].dwFence ) )
+            s_Dropped[k++] = s_Dropped[j];
+        else
+            s_Dropped[j].pTex->Release();
+    }
+    s_nDropped = k;
+}
+
+// Drawn covers are kept for what's on screen or about to be: the last open shelf's
+// cases within KEEP_NEAR of its front one (SHOWN_EACH_SIDE show each side; the rest are
+// made ahead so they're ready before they slide in) and every shelf's first few (what
+// it shows when it opens). They're dropped only past DROP_FAR, so stepping back and
+// forth doesn't remake them.
+static const int KEEP_NEAR = SHOWN_EACH_SIDE + 2, DROP_FAR = SHOWN_EACH_SIDE + 5;
+static const int HOME_ITEMS = SHOWN_EACH_SIDE + 1;
+static const int DRAWN_PER_FRAME = 4;
+
+static BOOL WantDrawn( int nShelf, int i, int nReach )
+{
+    return i < HOME_ITEMS || ( nShelf == s_nShelf && abs( i - s_nIndex ) <= nReach );
+}
+
+// Makes an item's missing drawn cover (no box art) and back (boxed shelves, unless its
+// art wraps the case); returns how many it made, at most nBudget. Nothing until it's
+// known whether the item has art.
+static int EnsureDrawn( D3DDevice* pDevice, int nShelf, int i, int nBudget )
+{
+    const BYTE art = s_Art[nShelf][i];
+    if( art == ART_UNTRIED || art == ART_DECODE )
+        return 0;
+    int nMade = 0;
+    BYTE& failed = s_Failed[nShelf][i];
+    const ScanItem& it = Scan_GetItem( nShelf, i );
+    if( art == ART_NONE && !s_pCover[nShelf][i] && !( failed & FAILED_FRONT ) && nMade < nBudget )
+    {
+        // A cover that can't be made (out of memory) is given up on, not retried every frame
+        if( !( s_pCover[nShelf][i] = MakeCover( pDevice, it, FALSE ) ) )
+            failed |= FAILED_FRONT;
         nMade++;
     }
-    if( art != ART_WRAP && c_bShelfBacks[nShelf] && !s_pBack[nShelf][i] && nMade < nBudget )
+    if( art != ART_WRAP && c_bShelfBacks[nShelf] && !s_pBack[nShelf][i] && !( failed & FAILED_BACK ) && nMade < nBudget )
     {
-        s_pBack[nShelf][i] = MakeCover( pDevice, it, TRUE );
+        if( !( s_pBack[nShelf][i] = MakeCover( pDevice, it, TRUE ) ) )
+            failed |= FAILED_BACK;
         nMade++;
     }
     return nMade;
 }
 
+
+//-------------------------------------------------------------------------------------
+// A rescan: the shelves' items move about, so their textures are matched up again
+//-------------------------------------------------------------------------------------
+static BOOL s_bRemapPending = FALSE;    // the library changed: covers follow before the next frame
+static char s_szDeletingId[12] = "";    // the title ID of the game our delete job is removing
+static char s_szDeletedId[12]  = "";    // ...once it's gone: PruneCache deletes its covers after the rescan
+
+struct OldArt { D3DTexture* pTex; BYTE art; DWORD dwKey; ArtStamp Stamp; BOOL bIcon; };
+static OldArt s_OldArt[NUM_SHELVES * MAX_SHELF];
+
+// Drawn covers are let go (they're quick to make again, near the view). Box art is kept
+// for every new item showing the same image: same title ID, and the image file not
+// replaced since. The rest of the old art is released.
+static void RemapCovers( D3DDevice* pDevice )
+{
+    // The GPU may still be drawing last frame's covers
+    pDevice->BlockUntilIdle();
+    ReleaseDropped( pDevice );
+
+    int nOld = 0;
+    for( int s = 0; s < NUM_SHELVES; s++ )
+        for( int i = 0; i < MAX_SHELF; i++ )
+        {
+            if( s_pCover[s][i] ) { s_pCover[s][i]->Release(); s_pCover[s][i] = NULL; }
+            if( s_pBack[s][i] )  { s_pBack[s][i]->Release();  s_pBack[s][i] = NULL; }
+            if( s_pArt[s][i] )
+            {
+                OldArt& o = s_OldArt[nOld++];
+                o.pTex  = s_pArt[s][i];
+                o.art   = s_Art[s][i];
+                o.dwKey = s_dwArtKey[s][i];
+                o.Stamp = s_ArtStamp[s][i];
+                o.bIcon = s == SHELF_ARCADE;
+                s_pArt[s][i] = NULL;
+            }
+            s_Art[s][i] = ART_UNTRIED;
+            s_Failed[s][i] = 0;
+        }
+
+    for( int s = 0; s < NUM_SHELVES && nOld; s++ )
+        for( int i = 0; i < ShelfCount( s ); i++ )
+        {
+            const ScanItem& it = Scan_GetItem( s, i );
+            if( !it.szTitleId[0] )
+                continue;
+            const DWORD dwKey = ArtKey( it.szTitleId );
+            ArtStamp Stamp = { 0, 0, 0 };
+            BOOL bStamp = FALSE;   // looked up once, and only if there's art to compare with
+            for( int k = 0; k < nOld; k++ )
+            {
+                const OldArt& o = s_OldArt[k];
+                if( o.dwKey != dwKey || o.bIcon != ( s == SHELF_ARCADE ) )
+                    continue;
+                if( !o.bIcon )
+                {
+                    if( !bStamp )
+                    {
+                        FindArtFile( it.szTitleId, &Stamp );   // none: stays zero, so no match
+                        bStamp = TRUE;
+                    }
+                    if( memcmp( &Stamp, &o.Stamp, sizeof(Stamp) ) != 0 )
+                        continue;   // the image was replaced (or removed): load it again
+                }
+                s_pArt[s][i] = o.pTex;
+                s_pArt[s][i]->AddRef();
+                s_Art[s][i]      = o.art;
+                s_dwArtKey[s][i] = o.dwKey;
+                s_ArtStamp[s][i] = o.Stamp;
+                break;
+            }
+        }
+
+    // Each slot held one reference; the ones kept were taken again above
+    for( int k = 0; k < nOld; k++ )
+        s_OldArt[k].pTex->Release();
+}
+
+static BOOL InLibrary( const char* szTitleId )
+{
+    for( int s = 0; s < NUM_SHELVES; s++ )
+        for( int i = 0; i < Scan_ItemCount( s ); i++ )
+            if( _stricmp( Scan_GetItem( s, i ).szTitleId, szTitleId ) == 0 )
+                return TRUE;
+    return FALSE;
+}
+
+// After a rescan, deletes cache files nothing will use again: leftovers of an
+// interrupted save (.tmp) and ones whose image is gone. A game Orbit just deleted loses
+// its images and icon first, unless another copy is still in the library. Games only
+// missing from the library keep theirs: their drive may just be unplugged. Names are
+// gathered first and deleted after, a batch at a time.
+static void PruneCache()
+{
+    if( s_szDeletedId[0] && !InLibrary( s_szDeletedId ) )
+    {
+        char szPath[MAX_PATH];
+        for( int d = 0; d < ARRAYSIZE( c_szCoverDirs ); d++ )
+            for( int e = 0; e < ARRAYSIZE( c_szArtExt ); e++ )
+            {
+                sprintf_s( szPath, "%s%s.%s", c_szCoverDirs[d], s_szDeletedId, c_szArtExt[e] );
+                DeleteFileA( szPath );
+            }
+        sprintf_s( szPath, "game:\\Covers\\Icons\\%s.png", s_szDeletedId );
+        DeleteFileA( szPath );
+    }
+    s_szDeletedId[0] = 0;
+
+    static const int BATCH = 32;
+    for( int d = 0; d < ARRAYSIZE( c_szCoverDirs ); d++ )
+    {
+        char szFind[MAX_PATH];
+        sprintf_s( szFind, "%sCache\\*", c_szCoverDirs[d] );
+        for( ;; )
+        {
+            static char szDelete[BATCH][MAX_PATH];   // (8 KB: not on the stack)
+            int nDelete = 0;
+            WIN32_FIND_DATAA fd;
+            HANDLE hFind = FindFirstFileA( szFind, &fd );
+            if( hFind == INVALID_HANDLE_VALUE )
+                break;
+            do
+            {
+                if( fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY )
+                    continue;
+                // <title ID>.dxt, <title ID>.<ext>.bad, or either with .tmp after; others aren't ours
+                const char* szName = fd.cFileName;
+                size_t n = strlen( szName );
+                BOOL bTmp = n > 4 && _stricmp( szName + n - 4, ".tmp" ) == 0;
+                BOOL bOurs = bTmp || ( n > 4 && ( _stricmp( szName + n - 4, ".dxt" ) == 0 || _stricmp( szName + n - 4, ".bad" ) == 0 ) );
+                if( !bOurs )
+                    continue;
+                BOOL bDelete = bTmp;
+                if( !bDelete )
+                {
+                    char szId[16];
+                    size_t nId = strcspn( szName, "." );
+                    if( nId == 0 || nId >= sizeof(szId) )
+                        continue;
+                    memcpy( szId, szName, nId );
+                    szId[nId] = 0;
+                    bDelete = !FindArtFile( szId, NULL );
+                }
+                if( bDelete )
+                    sprintf_s( szDelete[nDelete++], "%sCache\\%s", c_szCoverDirs[d], szName );
+            }
+            while( nDelete < BATCH && FindNextFileA( hFind, &fd ) );
+            FindClose( hFind );
+
+            int nGone = 0;
+            for( int k = 0; k < nDelete; k++ )
+                if( DeleteFileA( szDelete[k] ) )
+                    nGone++;
+            if( nDelete < BATCH || nGone == 0 )
+                break;   // none deleted (read-only): the same batch would come back forever
+        }
+    }
+}
+
+
+//-------------------------------------------------------------------------------------
+// Public: covers
+//-------------------------------------------------------------------------------------
 int Library_CoversRemaining( int* pnTotal )
 {
     int nTotal = 0, nLeft = 0;
     for( int s = 0; s < NUM_SHELVES; s++ )
-        for( int i = 0; i < min( Scan_ItemCount( s ), MAX_SHELF ); i++ )
+        for( int i = 0; i < ShelfCount( s ); i++ )
         {
             nTotal++;
             const BYTE art = s_Art[s][i];
-            BOOL bDone = !s_bReleasePending && art != ART_UNTRIED &&
-                         ( art != ART_NONE || s_pCover[s][i] ) &&
-                         ( art == ART_WRAP || !c_bShelfBacks[s] || s_pBack[s][i] );
-            if( !bDone )
+            if( s_bRemapPending || art == ART_UNTRIED || art == ART_DECODE )
                 nLeft++;
         }
     if( pnTotal )
@@ -646,42 +1033,82 @@ int Library_CoversRemaining( int* pnTotal )
     return nLeft;
 }
 
-void Library_PreloadCovers( D3DDevice* pDevice )
-{
-    for( int s = 0; s < NUM_SHELVES; s++ )
-        for( int i = 0; i < min( Scan_ItemCount( s ), MAX_SHELF ); i++ )
-            while( EnsureCovers( pDevice, s, i, 2 ) )
-                ;
-}
-
 void Library_PrepareCovers( D3DDevice* pDevice )
 {
-    if( s_bReleasePending )
+    if( s_bRemapPending )
     {
-        // The GPU may still be drawing last frame's covers
-        pDevice->BlockUntilIdle();
-        ReleaseCovers();
-        s_bReleasePending = FALSE;
+        RemapCovers( pDevice );
+        s_bRemapPending = FALSE;
+        PruneCache();
     }
+    ReleaseDropped( pDevice );
 
-    // Two units of work a frame: the open shelf nearest the front first, then (after a
-    // rescan replaced them) everything else in the background
-    int nMade = 0;
-    if( s_fLibScale > 0.01f || s_bOpen )
+    // Box art still to load: cache reads while the frame has time, and at most one
+    // decode (the slow part, a good fraction of a second), which ends the frame's share
+    static const DWORD ART_MS = 10;
+    const DWORD dwStart = GetTickCount();
+    BOOL bBusy = FALSE;
+    for( int s = 0; s < NUM_SHELVES && !bBusy; s++ )
+        for( int i = 0; i < ShelfCount( s ) && !bBusy; i++ )
+        {
+            const BYTE art = s_Art[s][i];
+            if( art != ART_UNTRIED && art != ART_DECODE )
+                continue;
+            LoadArt( pDevice, s, i, art == ART_DECODE );
+            if( s == s_nShelf && i == s_nIndex )
+                s_bHudDirty = TRUE;   // X BACK COVER may now apply
+            bBusy = art == ART_DECODE || GetTickCount() - dwStart >= ART_MS;
+        }
+
+    // Art that ran out of memory: retried now and then, never with the shelves up (it'd hitch them)
+    static const DWORD RETRY_MS = 10000;
+    static DWORD s_dwLastRetry = 0;
+    if( !bBusy && !s_bOpen && s_fLibScale <= 0.01f && GetTickCount() - s_dwLastRetry >= RETRY_MS && RoomToDecode() )
     {
-        const int n = ItemCount();
-        for( int d = 0; d <= 4 && nMade < 2; d++ )
-            for( int sg = -1; sg <= 1 && nMade < 2; sg += 2 )
+        BOOL bTried = FALSE;
+        for( int s = 0; s < NUM_SHELVES && !bTried; s++ )
+            for( int i = 0; i < ShelfCount( s ) && !bTried; i++ )
             {
-                int i = s_nIndex + d * sg;
-                if( i < 0 || i >= n || ( d == 0 && sg > 0 ) )
+                if( !s_ArtRetry[s][i] || s_Art[s][i] != ART_NONE )
                     continue;
-                nMade += EnsureCovers( pDevice, s_nShelf, i, 2 - nMade );
+                bTried = TRUE;
+                s_dwLastRetry = GetTickCount();
+                LoadArt( pDevice, s, i, TRUE );
+                if( s_Art[s][i] == ART_NONE )
+                    continue;
+                DropTexture( pDevice, s_pCover[s][i] );
+                if( s_Art[s][i] == ART_WRAP )
+                    DropTexture( pDevice, s_pBack[s][i] );
+                if( s == s_nShelf && i == s_nIndex )
+                    s_bHudDirty = TRUE;
             }
     }
-    for( int s = 0; s < NUM_SHELVES && nMade < 2; s++ )
-        for( int i = 0; i < min( Scan_ItemCount( s ), MAX_SHELF ) && nMade < 2; i++ )
-            nMade += EnsureCovers( pDevice, s, i, 2 - nMade );
+
+    // Drawn covers: let go of the ones far from view...
+    for( int s = 0; s < NUM_SHELVES; s++ )
+        for( int i = 0; i < MAX_SHELF; i++ )
+            if( ( s_pCover[s][i] || s_pBack[s][i] ) && ( i >= ShelfCount( s ) || !WantDrawn( s, i, DROP_FAR ) ) )
+            {
+                DropTexture( pDevice, s_pCover[s][i] );
+                DropTexture( pDevice, s_pBack[s][i] );
+                s_Failed[s][i] = 0;
+            }
+
+    // ...and make the near ones: the last open shelf's nearest the front first, then
+    // each shelf's first few
+    int nMade = 0;
+    const int n = ShelfCount( s_nShelf );
+    for( int d = 0; d <= KEEP_NEAR && nMade < DRAWN_PER_FRAME; d++ )
+        for( int sg = -1; sg <= 1 && nMade < DRAWN_PER_FRAME; sg += 2 )
+        {
+            int i = s_nIndex + d * sg;
+            if( i < 0 || i >= n || ( d == 0 && sg > 0 ) )
+                continue;
+            nMade += EnsureDrawn( pDevice, s_nShelf, i, DRAWN_PER_FRAME - nMade );
+        }
+    for( int s = 0; s < NUM_SHELVES && nMade < DRAWN_PER_FRAME; s++ )
+        for( int i = 0; i < min( ShelfCount( s ), HOME_ITEMS ) && nMade < DRAWN_PER_FRAME; i++ )
+            nMade += EnsureDrawn( pDevice, s, i, DRAWN_PER_FRAME - nMade );
 }
 
 
@@ -791,7 +1218,7 @@ BOOL Library_IsOpen() { return s_bOpen; }
 
 void Library_OnLibraryChanged()
 {
-    s_bReleasePending = TRUE;
+    s_bRemapPending = TRUE;
     s_nIndex = max( 0, min( s_nIndex, ItemCount() - 1 ) );
     s_bDetails = s_bConfirm = s_bFlipped = FALSE;
     if( s_bOpen )
@@ -834,6 +1261,8 @@ void Library_Update( float dt, int nMove, WORD wPressed, float* pfPulse )
                 char szUp[128];
                 UpperCopy( szUp, sizeof(szUp), sz );
                 Hud_ShowToast( szUp, 2.2f );
+                if( Job.nState == JOBSTATE_DONE )
+                    strcpy_s( s_szDeletedId, s_szDeletingId );   // PruneCache deletes its covers after the rescan
                 Drives_ClearJob();
                 Drives_Refresh();
                 Scan_Start();   // the shelf updates when the scan finishes
@@ -862,7 +1291,10 @@ void Library_Update( float dt, int nMove, WORD wPressed, float* pfPulse )
                     s_bConfirm = FALSE;
                     char szWhy[64];
                     if( Drives_StartDelete( it.szDelete, szWhy, sizeof(szWhy) ) )
+                    {
                         s_bDeleting = TRUE;
+                        strcpy_s( s_szDeletingId, it.szTitleId );   // its covers go after the rescan
+                    }
                     else
                     {
                         char sz[128];
@@ -983,13 +1415,13 @@ void Library_Render( D3DDevice* pDevice, const XMMATRIX& matView, const XMMATRIX
     XMMATRIX matLib = XMMatrixScaling( s_fLibScale, s_fLibScale, s_fLibScale ) * XMMatrixTranslation( 0.0f, 0.3f, 2.2f );
 
     // Visible cases, far to near
-    int   nOrder[MAX_SHELF], nItems = 0;
-    float fDepth[MAX_SHELF];
-    XMMATRIX matWorld[MAX_SHELF];
-    for( int i = 0; i < n; i++ )
+    // (static: a shelf can be long, and they'd be a lot for the stack)
+    static int      nOrder[MAX_SHELF];
+    static float    fDepth[MAX_SHELF];
+    static XMMATRIX matWorld[MAX_SHELF];
+    int nItems = 0;
+    for( int i = max( 0, s_nIndex - SHOWN_EACH_SIDE ); i < min( n, s_nIndex + SHOWN_EACH_SIDE + 1 ); i++ )
     {
-        if( abs( i - s_nIndex ) > 4 )
-            continue;
         const CaseState& cs = s_Cases[i];
         const float fThick = c_bShelfBoxed[s_nShelf] ? 1.0f : TILE_DEPTH;   // tiles are thin
         const float fTall  = c_bShelfSquare[s_nShelf] ? CASE_W / CASE_H : 1.0f;

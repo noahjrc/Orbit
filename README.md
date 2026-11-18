@@ -218,7 +218,24 @@ Orbit expects full wrap-around scans of 900×600 pixels, laid out back | spine |
 
 The first time Orbit loads a cover it saves a ready-to-draw copy in `Covers\Cache\`, so later starts are much quicker. Replacing a cover image is picked up automatically. The `Cache` folder is safe to delete; Orbit rebuilds it on the next start.
 
+Deleting a game from its details screen (**Y**) also deletes its cover image, cached copy and icon, unless another copy of the same game is still on the shelves.
+
 Arcade games don't use the `Covers` folder: their square tiles show the game's own icon, which a scan copies out of each package into `Covers\Icons\` (named by title ID). That folder is safe to delete too; the next **SCAN NOW** saves the icons again.
+
+## Game names
+
+Games in folders are named after their folder, so you can rename them from **FILES** (**LB**) and run **SCAN NOW**. Games on Demand packages carry their own name inside.
+
+Multi-disc games are tidied automatically: "Gears of War 2 - Limited Edition Bonus Disc" shows as "Gears of War 2 (Bonus Disc)", and "Disc 2", "Disk Two" or "[Disc 2]" all become "(Disc 2)".
+
+To give any game a name of your own, make a `names.txt` next to `Orbit.xex`, one game a line: the name Orbit shows, `=`, then the name you want.
+
+```
+Halo - Reach = Halo: Reach
+Halo 3 - ODST = Halo 3: ODST
+```
+
+Upper and lower case don't matter. New lines show the next time Orbit starts. If you change a name you've already set, run **SCAN NOW**.
 
 ## Title updates and DLC
 

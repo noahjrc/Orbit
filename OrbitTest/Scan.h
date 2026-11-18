@@ -19,6 +19,7 @@
 #pragma once
 
 enum { SHELF_XBOX, SHELF_360, SHELF_ARCADE, SHELF_APPS, NUM_SHELVES };
+static const int MAX_SCAN_ITEMS = 256;   // the whole library, every shelf together
 
 struct ScanItem
 {
