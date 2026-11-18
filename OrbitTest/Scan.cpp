@@ -8,9 +8,10 @@
 #include <ctype.h>
 #include "Scan.h"
 
-static const int   MAX_ITEMS = 256;
+static const int   MAX_ITEMS = MAX_SCAN_ITEMS;
 static const char* PATHS_FILE   = "game:\\paths.txt";
 static const char* LIBRARY_FILE = "game:\\library.txt";
+static const char* NAMES_FILE   = "game:\\names.txt";
 
 // There are no default paths: every setup keeps its games somewhere different, so
 // Orbit starts with none and they're added in SETTINGS (see the README).
@@ -389,7 +390,11 @@ static DWORD WINAPI ScanProc( LPVOID )
 {
     for( s_nWorkPath = 0; s_nWorkPath < s_nWorkPaths; s_nWorkPath++ )
         Walk( s_WorkPaths[s_nWorkPath].szPath, s_WorkPaths[s_nWorkPath].nDepth );
+    // volatile doesn't order memory on the 360's CPU: without this the main thread can
+    // see s_bFinished before the items, and copy stale titles and title IDs (wrong covers)
+    MemoryBarrier();
     s_bFinished = TRUE;
+    MemoryBarrier();
     s_bRunning = FALSE;
     return 0;
 }
@@ -470,9 +475,147 @@ static int CompareTitles( const void* a, const void* b )
     return _stricmp( s_Lib[*(const int*)a].szTitle, s_Lib[*(const int*)b].szTitle );
 }
 
+//-------------------------------------------------------------------------------------
+// Names: disc names tidied, then names.txt's own names
+//-------------------------------------------------------------------------------------
+static BOOL IsWordChar( char c ) { return isalnum( (unsigned char)c ) != 0; }
+
+static void TrimEnd( char* sz )
+{
+    size_t n = strlen( sz );
+    while( n && strchr( " \t-:([,", sz[n - 1] ) )
+        sz[--n] = 0;
+}
+
+static void Trim( char* sz )
+{
+    size_t n = strlen( sz );
+    while( n && ( sz[n - 1] == ' ' || sz[n - 1] == '\t' ) )
+        sz[--n] = 0;
+    size_t nLead = strspn( sz, " \t" );
+    memmove( sz, sz + nLead, strlen( sz + nLead ) + 1 );
+}
+
+// Ends with "<phrase>" as whole words (case folded)?
+static BOOL EndsWithWords( const char* sz, const char* szPhrase )
+{
+    size_t n = strlen( sz ), nPhrase = strlen( szPhrase );
+    return n >= nPhrase && _stricmp( sz + n - nPhrase, szPhrase ) == 0 &&
+           ( n == nPhrase || !IsWordChar( sz[n - nPhrase - 1] ) );
+}
+
+// "Gears of War 2 - Limited Edition Bonus Disc" -> "Gears of War 2 (Bonus Disc)",
+// "Halo [Disk Two]" -> "Halo (Disc 2)". A "Disc" with no number after it and no "Bonus"
+// before it (a game called "Disc Jam") is left alone.
+static void TidyDiscName( char* szTitle, size_t nTitle )
+{
+    static const char* c_szNumbers[]  = { "one", "two", "three", "four" };
+    static const char* c_szEditions[] = { "limited edition", "collector's edition", "collectors edition", "special edition",
+                                          "legendary edition", "deluxe edition", "ultimate edition", "epic edition",
+                                          "game of the year edition" };
+    const size_t n = strlen( szTitle );
+    for( size_t i = 0; i + 4 <= n; i++ )
+    {
+        if( ( _strnicmp( szTitle + i, "disc", 4 ) != 0 && _strnicmp( szTitle + i, "disk", 4 ) != 0 ) ||
+            ( i > 0 && IsWordChar( szTitle[i - 1] ) ) || IsWordChar( szTitle[i + 4] ) )
+            continue;
+
+        int nDisc = 0;
+        const char* p = szTitle + i + 4;
+        while( *p == ' ' || *p == '-' || *p == ':' || *p == '#' )
+            p++;
+        if( isdigit( (unsigned char)*p ) )
+            nDisc = atoi( p );
+        else
+            for( int k = 0; k < ARRAYSIZE( c_szNumbers ); k++ )
+            {
+                const size_t nLen = strlen( c_szNumbers[k] );
+                if( _strnicmp( p, c_szNumbers[k], nLen ) == 0 && !IsWordChar( p[nLen] ) )
+                    nDisc = k + 1;
+            }
+
+        size_t nCut = i;
+        while( nCut > 0 && szTitle[nCut - 1] == ' ' )
+            nCut--;
+        const BOOL bBonus = nCut >= 5 && _strnicmp( szTitle + nCut - 5, "bonus", 5 ) == 0 &&
+                            ( nCut == 5 || !IsWordChar( szTitle[nCut - 6] ) );
+        if( bBonus )
+            nCut -= 5;
+        else if( nDisc <= 0 )
+            continue;
+
+        char szBase[64];
+        strncpy_s( szBase, szTitle, min( nCut, sizeof(szBase) - 1 ) );
+        TrimEnd( szBase );
+        for( int k = 0; k < ARRAYSIZE( c_szEditions ); k++ )
+            if( EndsWithWords( szBase, c_szEditions[k] ) )
+            {
+                szBase[strlen( szBase ) - strlen( c_szEditions[k] )] = 0;
+                TrimEnd( szBase );
+                break;
+            }
+        if( !szBase[0] )
+            return;
+        if( bBonus )
+            sprintf_s( szTitle, nTitle, "%s (Bonus Disc)", szBase );
+        else
+            sprintf_s( szTitle, nTitle, "%s (Disc %d)", szBase, nDisc );
+        return;
+    }
+}
+
+// names.txt: "name as found = name to show", one a line. Read each time the shelves are
+// rebuilt, so an added line shows on the next start.
+static void ApplyNames()
+{
+    struct NameRule { char szFrom[64], szTo[64]; };
+    static const int MAX_NAMES = 64;
+    static NameRule s_Rules[MAX_NAMES];
+    int nRules = 0;
+    FILE* f = NULL;
+    if( fopen_s( &f, NAMES_FILE, "r" ) == 0 && f )
+    {
+        char szLine[256];
+        while( nRules < MAX_NAMES && fgets( szLine, sizeof(szLine), f ) )
+        {
+            szLine[strcspn( szLine, "\r\n" )] = 0;
+            char* pLine = szLine;
+            if( memcmp( pLine, "\xEF\xBB\xBF", 3 ) == 0 )   // Notepad's UTF-8 mark
+                pLine += 3;
+            char* pEq = strchr( pLine, '=' );
+            if( !pEq )
+                continue;
+            *pEq = 0;
+            NameRule& r = s_Rules[nRules];
+            strncpy_s( r.szFrom, pLine, _TRUNCATE );
+            strncpy_s( r.szTo, pEq + 1, _TRUNCATE );
+            Trim( r.szFrom );
+            Trim( r.szTo );
+            if( r.szFrom[0] && r.szTo[0] )
+                nRules++;
+        }
+        fclose( f );
+    }
+
+    for( int i = 0; i < s_nLib; i++ )
+    {
+        ScanItem& it = s_Lib[i];
+        char szFound[64];
+        strcpy_s( szFound, it.szTitle );
+        TidyDiscName( it.szTitle, sizeof(it.szTitle) );
+        for( int k = 0; k < nRules; k++ )
+            if( _stricmp( s_Rules[k].szFrom, szFound ) == 0 || _stricmp( s_Rules[k].szFrom, it.szTitle ) == 0 )
+            {
+                strcpy_s( it.szTitle, s_Rules[k].szTo );
+                break;
+            }
+    }
+}
+
 // Groups the library by shelf, each alphabetical
 static void IndexLibrary()
 {
+    ApplyNames();
     for( int s = 0; s < NUM_SHELVES; s++ )
         s_nShelf[s] = 0;
     for( int i = 0; i < s_nLib; i++ )
@@ -608,13 +751,21 @@ void Scan_Start()
         s_bRunning = FALSE;
 }
 
-BOOL Scan_IsRunning() { return s_bRunning; }
+// TRUE until Scan_Poll takes the results; the flags are read in the reverse of ScanProc's write order
+BOOL Scan_IsRunning()
+{
+    if( s_bRunning )
+        return TRUE;
+    MemoryBarrier();
+    return s_bFinished;
+}
 int  Scan_FoundSoFar() { return s_nWork; }
 
 BOOL Scan_Poll()
 {
     if( !s_bFinished )
         return FALSE;
+    MemoryBarrier();   // pairs with ScanProc's: the items are read after the flag
     s_bFinished = FALSE;
     s_nLib = s_nWork;
     for( int i = 0; i < s_nLib; i++ )

@@ -25,15 +25,14 @@ void    Library_OnLibraryChanged();
 // pressed buttons. Sets *pfPulse to 1 on launch. Closes itself on B.
 void    Library_Update( float dt, int nMove, WORD wPressed, float* pfPulse );
 
-// Loads every shelf's box art and draws the covers for items without any, so the
-// shelves open without a hitch. Call once at start, after the library is loaded.
-void    Library_PreloadCovers( D3DDevice* pDevice );
-
-// Items whose covers are still to load (after a rescan replaced them); *pnTotal = all items
+// Items whose box art is still to load (images decoding for the first time, or a rescan
+// not yet matched up); *pnTotal = all items
 int     Library_CoversRemaining( int* pnTotal );
 
-// Fills in covers still missing (after a rescan), a couple per frame, the open shelf's
-// nearest first. Call before the frame's scene starts (it uses its own render target).
+// Loads box art still missing (cache reads while the frame has time, at most one decode,
+// and now and then one that ran short of memory before), lets go of drawn covers far
+// from the view and makes the near ones. Call before the frame's scene starts (it uses
+// its own render target).
 void    Library_PrepareCovers( D3DDevice* pDevice );
 
 // Cases, onto the back buffer after Post_EndFrame (no depth), far to near

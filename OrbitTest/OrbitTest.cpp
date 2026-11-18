@@ -297,8 +297,9 @@ static float Damp( float x, float y, float fLambda, float dt )
     return x + ( y - x ) * ( 1.0f - expf( -fLambda * dt ) );
 }
 
-// While the library updates (a scan, then its covers loading) a LIBRARY card shows the
-// progress and the controller waits, so nothing opens half loaded or hitches
+// While the library updates (a scan, then any box art decoding for the first time) a
+// LIBRARY card shows the progress and the controller waits, so nothing opens half loaded
+// or hitches. Box art already in the cache, and drawn covers, never hold it up.
 BOOL g_bBusyCard = FALSE;
 
 static BOOL LibraryBusy()
@@ -492,7 +493,6 @@ void __cdecl main()
     Profile_Init( g_pd3dDevice );                  // the top bar's profile badge
     Sound_Init();                                  // the hum fades in while the rest loads
     Scan_Init();                                   // saved library, or a first scan
-    Library_PreloadCovers( g_pd3dDevice );         // all box art now, so shelves open without a hitch
 
     InitTime();
 
